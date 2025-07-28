@@ -4,407 +4,412 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\SnagReport;
-use App\Models\SnagReportPhoto;
+use App\Models\Project;
+use App\Models\UserCompany;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Exception;
 
 class SnagReportController extends Controller
 {
     public function index(Request $request)
     {
-        $user = $request->user();
-        
-        $snagReports = SnagReport::with([
-            'project', 
-            'task', 
-            'reportedBy', 
-            'assignedTo', 
-            'resolvedBy',
-            'photos'
-        ])
-        ->whereHas('project', function ($query) use ($user) {
-            $query->whereHas('company', function ($q) use ($user) {
-                $q->whereHas('users', function ($uq) use ($user) {
-                    $uq->where('user_id', $user->id);
-                });
-            });
-        })
-        ->when($request->project_id, function ($query, $projectId) {
-            return $query->where('project_id', $projectId);
-        })
-        ->when($request->task_id, function ($query, $taskId) {
-            return $query->where('task_id', $taskId);
-        })
-        ->when($request->status, function ($query, $status) {
-            return $query->where('status', $status);
-        })
-        ->when($request->severity, function ($query, $severity) {
-            return $query->where('severity', $severity);
-        })
-        ->when($request->assigned_to, function ($query, $assignedTo) {
-            return $query->where('assigned_to', $assignedTo);
-        })
-        ->when($request->reported_by, function ($query, $reportedBy) {
-            return $query->where('reported_by', $reportedBy);
-        })
-        ->when($request->search, function ($query, $search) {
-            return $query->where(function ($q) use ($search) {
-                $q->where('title', 'like', "%{$search}%")
-                  ->orWhere('description', 'like', "%{$search}%");
-            });
-        })
-        ->orderBy('created_at', 'desc')
-        ->paginate($request->per_page ?? 15);
+        try {
+            $validator = Validator::make($request->all(), [
+                'project_id' => 'required|exists:projects,id',
+                'status' => 'nullable|in:reported,in_progress,resolved,rejected',
+                'priority' => 'nullable|in:low,medium,high,critical',
+                'category' => 'nullable|string|max:100',
+                'reported_by' => 'nullable|exists:users,id',
+                'assigned_to' => 'nullable|exists:users,id',
+                'page' => 'nullable|integer|min:1',
+                'limit' => 'nullable|integer|min:1|max:100',
+            ], [
+                'project_id.required' => 'Project ID is required',
+                'project_id.exists' => 'Invalid project selected',
+                'status.in' => 'Invalid status value',
+                'priority.in' => 'Invalid priority value',
+                'category.max' => 'Category cannot exceed 100 characters',
+                'reported_by.exists' => 'Invalid reporter selected',
+                'assigned_to.exists' => 'Invalid assignee selected',
+                'page.integer' => 'Page must be an integer',
+                'page.min' => 'Page must be at least 1',
+                'limit.integer' => 'Limit must be an integer',
+                'limit.min' => 'Limit must be at least 1',
+                'limit.max' => 'Limit cannot exceed 100',
+            ]);
 
-        return response()->json([
-            'success' => true,
-            'data' => $snagReports
-        ]);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $project = Project::find($request->project_id);
+
+            if (!$project) {
+                return $this->toJsonEnc([], 'Project not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $query = SnagReport::with(['project', 'reporter', 'assignee', 'photos'])
+                ->where('project_id', $request->project_id)
+                ->where('is_deleted', 0);
+
+            if ($request->has('status')) {
+                $query->where('status', $request->status);
+            }
+
+            if ($request->has('priority')) {
+                $query->where('priority', $request->priority);
+            }
+
+            if ($request->has('category')) {
+                $query->where('category', $request->category);
+            }
+
+            if ($request->has('reported_by')) {
+                $query->where('reported_by', $request->reported_by);
+            }
+
+            if ($request->has('assigned_to')) {
+                $query->where('assigned_to', $request->assigned_to);
+            }
+
+            $limit = $request->get('limit', 10);
+            $snagReports = $query->orderBy('created_at', 'desc')
+                ->paginate($limit);
+
+            return $this->toJsonEnc($snagReports, 'Snag reports retrieved successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
     }
 
     public function store(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'project_id' => 'required|exists:projects,id',
-            'task_id' => 'nullable|exists:tasks,id',
-            'title' => 'required|string|max:255',
-            'description' => 'required|string',
-            'severity' => 'required|in:low,medium,high,critical',
-            'priority' => 'required|in:low,medium,high,critical',
-            'due_date' => 'required|date',
-            'assigned_to' => 'nullable|exists:users,id',
-            'location' => 'nullable|string|max:255',
-            'estimated_cost' => 'nullable|numeric|min:0',
-            'tags' => 'nullable|array',
-            'tags.*' => 'string|max:50',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
         try {
-            $snagReport = SnagReport::create([
-                'project_id' => $request->project_id,
-                'task_id' => $request->task_id,
-                'title' => $request->title,
-                'description' => $request->description,
-                'severity' => $request->severity,
-                'priority' => $request->priority,
-                'status' => 'open',
-                'due_date' => $request->due_date,
-                'assigned_to' => $request->assigned_to,
-                'reported_by' => $request->user()->id,
-                'location' => $request->location,
-                'estimated_cost' => $request->estimated_cost ?? 0,
-                'actual_cost' => 0,
-                'tags' => $request->tags ?? [],
-                'metadata' => [],
+            $validator = Validator::make($request->all(), [
+                'project_id' => 'required|exists:projects,id',
+                'title' => 'required|string|max:255',
+                'description' => 'required|string|max:2000',
+                'location' => 'required|string|max:500',
+                'category' => 'required|string|max:100',
+                'priority' => 'required|in:low,medium,high,critical',
+                'severity' => 'required|in:minor,major,critical',
+                'assigned_to' => 'nullable|exists:users,id',
+                'due_date' => 'nullable|date',
+                'photos' => 'nullable|array',
+                'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
+            ], [
+                'project_id.required' => 'Project ID is required',
+                'project_id.exists' => 'Invalid project selected',
+                'title.required' => 'Snag title is required',
+                'title.max' => 'Title cannot exceed 255 characters',
+                'description.required' => 'Description is required',
+                'description.max' => 'Description cannot exceed 2000 characters',
+                'location.required' => 'Location is required',
+                'location.max' => 'Location cannot exceed 500 characters',
+                'category.required' => 'Category is required',
+                'category.max' => 'Category cannot exceed 100 characters',
+                'priority.required' => 'Priority is required',
+                'priority.in' => 'Invalid priority value',
+                'severity.required' => 'Severity is required',
+                'severity.in' => 'Invalid severity value',
+                'assigned_to.exists' => 'Invalid assignee selected',
+                'due_date.date' => 'Invalid due date format',
+                'photos.array' => 'Photos must be an array',
+                'photos.*.image' => 'Each photo must be an image file',
+                'photos.*.mimes' => 'Photos must be in JPEG, PNG, or JPG format',
+                'photos.*.max' => 'Each photo file size cannot exceed 2MB',
             ]);
 
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Snag report created successfully',
-                'data' => $snagReport->load([
-                    'project', 
-                    'task', 
-                    'reportedBy', 
-                    'assignedTo'
-                ])
-            ], 201);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to create snag report',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    public function show(Request $request, SnagReport $snagReport)
-    {
-        $snagReport->load([
-            'project',
-            'task',
-            'reportedBy',
-            'assignedTo',
-            'resolvedBy',
-            'photos'
-        ]);
-
-        return response()->json([
-            'success' => true,
-            'data' => $snagReport
-        ]);
-    }
-
-    public function update(Request $request, SnagReport $snagReport)
-    {
-        $validator = Validator::make($request->all(), [
-            'title' => 'sometimes|string|max:255',
-            'description' => 'sometimes|string',
-            'severity' => 'sometimes|in:low,medium,high,critical',
-            'priority' => 'sometimes|in:low,medium,high,critical',
-            'due_date' => 'sometimes|date',
-            'assigned_to' => 'nullable|exists:users,id',
-            'location' => 'nullable|string|max:255',
-            'estimated_cost' => 'nullable|numeric|min:0',
-            'tags' => 'nullable|array',
-            'tags.*' => 'string|max:50',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
-        try {
-            $snagReport->update($request->all());
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Snag report updated successfully',
-                'data' => $snagReport->load([
-                    'project', 
-                    'task', 
-                    'reportedBy', 
-                    'assignedTo'
-                ])
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update snag report',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    public function updateStatus(Request $request, SnagReport $snagReport)
-    {
-        $validator = Validator::make($request->all(), [
-            'status' => 'required|in:open,in_progress,resolved,closed,rejected',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $updateData = ['status' => $request->status];
-
-        if ($request->status === 'resolved') {
-            $updateData['resolved_at'] = now();
-            $updateData['resolved_by'] = $request->user()->id;
-        } elseif ($request->status === 'closed') {
-            $updateData['closed_at'] = now();
-        }
-
-        $snagReport->update($updateData);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Snag report status updated successfully',
-            'data' => $snagReport->load([
-                'project', 
-                'task', 
-                'reportedBy', 
-                'assignedTo', 
-                'resolvedBy'
-            ])
-        ]);
-    }
-
-    public function assignUser(Request $request, SnagReport $snagReport)
-    {
-        $validator = Validator::make($request->all(), [
-            'user_id' => 'required|exists:users,id',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $snagReport->update(['assigned_to' => $request->user_id]);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Snag report assigned successfully',
-            'data' => $snagReport->load([
-                'project', 
-                'task', 
-                'reportedBy', 
-                'assignedTo'
-            ])
-        ]);
-    }
-
-    public function uploadPhotos(Request $request, SnagReport $snagReport)
-    {
-        $validator = Validator::make($request->all(), [
-            'photos' => 'required|array',
-            'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
-            'descriptions' => 'nullable|array',
-            'descriptions.*' => 'nullable|string|max:255',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
-        try {
-            $uploadedPhotos = [];
-
-            foreach ($request->file('photos') as $index => $photo) {
-                $path = $photo->store('snag_photos', 'public');
-                
-                $snagPhoto = SnagReportPhoto::create([
-                    'snag_report_id' => $snagReport->id,
-                    'file_path' => $path,
-                    'file_name' => $photo->getClientOriginalName(),
-                    'file_size' => $photo->getSize(),
-                    'mime_type' => $photo->getMimeType(),
-                    'description' => $request->descriptions[$index] ?? null,
-                    'uploaded_by' => $request->user()->id,
-                ]);
-
-                $uploadedPhotos[] = $snagPhoto;
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
             }
 
-            DB::commit();
+            $project = Project::find($request->project_id);
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Photos uploaded successfully',
-                'data' => $uploadedPhotos
-            ], 201);
+            if (!$project) {
+                return $this->toJsonEnc([], 'Project not found', '404');
+            }
 
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to upload photos',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $project->company_id)
+                ->where('status', 'active')
+                ->exists();
 
-    public function getPhotos(Request $request, SnagReport $snagReport)
-    {
-        $photos = $snagReport->photos()->with('uploadedBy')->get();
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
 
-        return response()->json([
-            'success' => true,
-            'data' => $photos
-        ]);
-    }
+            // Create snag report
+            $snagReport = new SnagReport();
+            $snagReport->project_id = $request->project_id;
+            $snagReport->title = $request->title;
+            $snagReport->description = $request->description;
+            $snagReport->location = $request->location;
+            $snagReport->category = $request->category;
+            $snagReport->priority = $request->priority;
+            $snagReport->severity = $request->severity;
+            $snagReport->status = 'reported';
+            $snagReport->reported_by = $request->user_id;
+            $snagReport->assigned_to = $request->assigned_to;
+            $snagReport->due_date = $request->due_date;
+            $snagReport->code = $this->generateSnagCode();
+            $snagReport->is_deleted = false;
 
-    public function destroy(Request $request, SnagReport $snagReport)
-    {
-        DB::beginTransaction();
-        try {
-            // Delete associated photos
-            foreach ($snagReport->photos as $photo) {
-                if ($photo->file_path) {
-                    Storage::disk('public')->delete($photo->file_path);
+            $snagReport->save();
+
+            // Handle photo uploads if provided
+            if ($request->hasFile('photos')) {
+                foreach ($request->file('photos') as $photo) {
+                    $photoPath = $photo->store('snag_photos', 'public');
+                    
+                    $snagReport->photos()->create([
+                        'file_path' => $photoPath,
+                        'file_type' => $photo->getClientOriginalExtension(),
+                        'file_size' => $photo->getSize(),
+                        'uploaded_by' => $request->user_id,
+                    ]);
                 }
-                $photo->delete();
             }
 
-            $snagReport->delete();
-            DB::commit();
+            return $this->toJsonEnc($snagReport->load(['project', 'reporter', 'assignee', 'photos']), 'Snag report created successfully', '201');
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Snag report deleted successfully'
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to delete snag report',
-                'error' => $e->getMessage()
-            ], 500);
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
     }
 
-    public function summary(Request $request)
+    public function show(Request $request, $id)
     {
-        $user = $request->user();
-        $company = $user->currentCompany;
+        try {
+            $snagReport = SnagReport::with(['project', 'reporter', 'assignee', 'photos'])
+                ->where('id', $id)
+                ->where('is_deleted', 0)
+                ->first();
 
-        if (!$company) {
-            return response()->json([
-                'success' => false,
-                'message' => 'No company selected'
-            ], 400);
+            if (!$snagReport) {
+                return $this->toJsonEnc([], 'Snag report not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $snagReport->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            return $this->toJsonEnc($snagReport, 'Snag report retrieved successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    public function update(Request $request, $id)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'title' => 'sometimes|required|string|max:255',
+                'description' => 'nullable|string|max:2000',
+                'location' => 'nullable|string|max:500',
+                'category' => 'sometimes|required|string|max:100',
+                'priority' => 'sometimes|required|in:low,medium,high,critical',
+                'severity' => 'sometimes|required|in:minor,major,critical',
+                'assigned_to' => 'nullable|exists:users,id',
+                'due_date' => 'nullable|date',
+                'photos' => 'nullable|array',
+                'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $snagReport = SnagReport::find($id);
+
+            if (!$snagReport) {
+                return $this->toJsonEnc([], 'Snag report not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $snagReport->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $updateData = $request->only([
+                'title', 'description', 'location', 'category', 'priority',
+                'severity', 'assigned_to', 'due_date'
+            ]);
+
+            $snagReport->update($updateData);
+
+            // Handle new photo uploads
+            if ($request->hasFile('photos')) {
+                foreach ($request->file('photos') as $photo) {
+                    $photoPath = $photo->store('snag_photos', 'public');
+                    
+                    $snagReport->photos()->create([
+                        'file_path' => $photoPath,
+                        'file_type' => $photo->getClientOriginalExtension(),
+                        'file_size' => $photo->getSize(),
+                        'uploaded_by' => $request->user_id,
+                    ]);
+                }
+            }
+
+            return $this->toJsonEnc($snagReport->load(['project', 'reporter', 'assignee', 'photos']), 'Snag report updated successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    public function destroy(Request $request, $id)
+    {
+        try {
+            $snagReport = SnagReport::find($id);
+
+            if (!$snagReport) {
+                return $this->toJsonEnc([], 'Snag report not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $snagReport->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            // Soft delete
+            $snagReport->update(['is_deleted' => true]);
+
+            return $this->toJsonEnc([], 'Snag report deleted successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    public function updateStatus(Request $request, $id)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'status' => 'required|in:reported,in_progress,resolved,rejected',
+                'notes' => 'nullable|string|max:2000',
+            ], [
+                'status.required' => 'Status is required',
+                'status.in' => 'Invalid status value',
+                'notes.max' => 'Notes cannot exceed 2000 characters',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $snagReport = SnagReport::find($id);
+
+            if (!$snagReport) {
+                return $this->toJsonEnc([], 'Snag report not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $snagReport->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $updateData = ['status' => $request->status];
+            if ($request->has('notes')) {
+                $updateData['notes'] = $request->notes;
+            }
+
+            $snagReport->update($updateData);
+
+            return $this->toJsonEnc($snagReport->load(['project', 'reporter', 'assignee']), 'Snag report status updated successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    public function assign(Request $request, $id)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'assigned_to' => 'required|exists:users,id',
+            ], [
+                'assigned_to.required' => 'Assignee is required',
+                'assigned_to.exists' => 'Invalid assignee selected',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $snagReport = SnagReport::find($id);
+
+            if (!$snagReport) {
+                return $this->toJsonEnc([], 'Snag report not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $snagReport->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $snagReport->update([
+                'assigned_to' => $request->assigned_to,
+                'status' => 'in_progress'
+            ]);
+
+            return $this->toJsonEnc($snagReport->load(['project', 'reporter', 'assignee']), 'Snag report assigned successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    private function generateSnagCode()
+    {
+        $code = 'SNAG' . strtoupper(Str::random(6));
+        
+        while (SnagReport::where('code', $code)->exists()) {
+            $code = 'SNAG' . strtoupper(Str::random(6));
         }
 
-        $summary = [
-            'total_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->count(),
-            'open_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'open')->count(),
-            'in_progress_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'in_progress')->count(),
-            'resolved_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'resolved')->count(),
-            'closed_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'closed')->count(),
-            'overdue_snags' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('due_date', '<', now())
-              ->whereNotIn('status', ['resolved', 'closed'])
-              ->count(),
-            'snags_by_severity' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->select('severity', DB::raw('count(*) as count'))
-              ->groupBy('severity')
-              ->pluck('count', 'severity'),
-            'total_estimated_cost' => SnagReport::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->sum('estimated_cost'),
-        ];
-
-        return response()->json([
-            'success' => true,
-            'data' => $summary
-        ]);
+        return $code;
     }
 }

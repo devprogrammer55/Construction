@@ -4,382 +4,359 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Inspection;
-use App\Models\InspectionPhoto;
+use App\Models\Project;
+use App\Models\UserCompany;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Exception;
 
 class InspectionController extends Controller
 {
     public function index(Request $request)
     {
-        $user = $request->user();
-        
-        $inspections = Inspection::with(['project', 'task', 'inspector'])
-            ->whereHas('project', function ($query) use ($user) {
-                $query->whereHas('company', function ($q) use ($user) {
-                    $q->whereHas('users', function ($uq) use ($user) {
-                        $uq->where('user_id', $user->id);
-                    });
-                });
-            })
-            ->when($request->project_id, function ($query, $projectId) {
-                return $query->where('project_id', $projectId);
-            })
-            ->when($request->task_id, function ($query, $taskId) {
-                return $query->where('task_id', $taskId);
-            })
-            ->when($request->inspector_id, function ($query, $inspectorId) {
-                return $query->where('inspector_id', $inspectorId);
-            })
-            ->when($request->status, function ($query, $status) {
-                return $query->where('status', $status);
-            })
-            ->when($request->category, function ($query, $category) {
-                return $query->where('category', $category);
-            })
-            ->when($request->priority, function ($query, $priority) {
-                return $query->where('priority', $priority);
-            })
-            ->when($request->search, function ($query, $search) {
-                return $query->where(function ($q) use ($search) {
-                    $q->where('title', 'like', "%{$search}%")
-                      ->orWhere('description', 'like', "%{$search}%");
-                });
-            })
-            ->orderBy('scheduled_date', 'desc')
-            ->paginate($request->per_page ?? 15);
+        try {
+            $validator = Validator::make($request->all(), [
+                'project_id' => 'required|exists:projects,id',
+                'status' => 'nullable|in:scheduled,in_progress,completed,failed',
+                'inspector_id' => 'nullable|exists:users,id',
+                'page' => 'nullable|integer|min:1',
+                'limit' => 'nullable|integer|min:1|max:100',
+            ], [
+                'project_id.required' => 'Project ID is required',
+                'project_id.exists' => 'Invalid project selected',
+                'status.in' => 'Invalid status value',
+                'inspector_id.exists' => 'Invalid inspector selected',
+                'page.integer' => 'Page must be an integer',
+                'page.min' => 'Page must be at least 1',
+                'limit.integer' => 'Limit must be an integer',
+                'limit.min' => 'Limit must be at least 1',
+                'limit.max' => 'Limit cannot exceed 100',
+            ]);
 
-        return response()->json([
-            'success' => true,
-            'data' => $inspections
-        ]);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $project = Project::find($request->project_id);
+
+            if (!$project) {
+                return $this->toJsonEnc([], 'Project not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $query = Inspection::with(['project', 'inspector', 'photos'])
+                ->where('project_id', $request->project_id)
+                ->where('is_deleted', 0);
+
+            if ($request->has('status')) {
+                $query->where('status', $request->status);
+            }
+
+            if ($request->has('inspector_id')) {
+                $query->where('inspector_id', $request->inspector_id);
+            }
+
+            $limit = $request->get('limit', 10);
+            $inspections = $query->orderBy('inspection_date', 'desc')
+                ->paginate($limit);
+
+            return $this->toJsonEnc($inspections, 'Inspections retrieved successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
     }
 
     public function store(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'project_id' => 'required|exists:projects,id',
-            'task_id' => 'nullable|exists:tasks,id',
-            'inspector_id' => 'required|exists:users,id',
-            'title' => 'required|string|max:255',
-            'description' => 'nullable|string',
-            'category' => 'required|in:safety,quality,compliance,progress,final,pre_delivery',
-            'scheduled_date' => 'required|date',
-            'priority' => 'required|in:low,medium,high,critical',
-            'notes' => 'nullable|string',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
         try {
-            $inspection = Inspection::create([
-                'project_id' => $request->project_id,
-                'task_id' => $request->task_id,
-                'inspector_id' => $request->inspector_id,
-                'title' => $request->title,
-                'description' => $request->description,
-                'category' => $request->category,
-                'scheduled_date' => $request->scheduled_date,
-                'status' => 'scheduled',
-                'priority' => $request->priority,
-                'notes' => $request->notes,
-                'findings' => null,
-                'recommendations' => null,
-                'score' => null,
-                'metadata' => [],
+            // Step 3.1: Validation
+            $validator = Validator::make($request->all(), [
+                'project_id' => 'required|exists:projects,id',
+                'title' => 'required|string|max:255',
+                'description' => 'nullable|string|max:1000',
+                'inspection_date' => 'required|date',
+                'inspector_id' => 'required|exists:users,id',
+                'category' => 'required|string|max:100',
+                'priority' => 'required|in:low,medium,high,urgent',
+                'status' => 'nullable|in:scheduled,in_progress,completed,failed',
+                'notes' => 'nullable|string|max:2000',
+                'checklist' => 'nullable|array',
+                'photos' => 'nullable|array',
+                'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
+            ], [
+                'project_id.required' => 'Project ID is required',
+                'project_id.exists' => 'Invalid project selected',
+                'title.required' => 'Inspection title is required',
+                'title.max' => 'Title cannot exceed 255 characters',
+                'description.max' => 'Description cannot exceed 1000 characters',
+                'inspection_date.required' => 'Inspection date is required',
+                'inspection_date.date' => 'Invalid inspection date format',
+                'inspector_id.required' => 'Inspector ID is required',
+                'inspector_id.exists' => 'Invalid inspector selected',
+                'category.required' => 'Category is required',
+                'category.max' => 'Category cannot exceed 100 characters',
+                'priority.required' => 'Priority is required',
+                'priority.in' => 'Invalid priority value',
+                'status.in' => 'Invalid status value',
+                'notes.max' => 'Notes cannot exceed 2000 characters',
+                'checklist.array' => 'Checklist must be an array',
+                'photos.array' => 'Photos must be an array',
+                'photos.*.image' => 'Each photo must be an image file',
+                'photos.*.mimes' => 'Photos must be in JPEG, PNG, or JPG format',
+                'photos.*.max' => 'Each photo file size cannot exceed 2MB',
             ]);
 
-            DB::commit();
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Inspection scheduled successfully',
-                'data' => $inspection->load(['project', 'task', 'inspector'])
-            ], 201);
+            $project = Project::find($request->project_id);
 
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to schedule inspection',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
+            if (!$project) {
+                return $this->toJsonEnc([], 'Project not found', '404');
+            }
 
-    public function show(Request $request, Inspection $inspection)
-    {
-        $inspection->load([
-            'project',
-            'task',
-            'inspector',
-            'photos'
-        ]);
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $project->company_id)
+                ->where('status', 'active')
+                ->exists();
 
-        return response()->json([
-            'success' => true,
-            'data' => $inspection
-        ]);
-    }
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
 
-    public function update(Request $request, Inspection $inspection)
-    {
-        $validator = Validator::make($request->all(), [
-            'title' => 'sometimes|string|max:255',
-            'description' => 'nullable|string',
-            'category' => 'sometimes|in:safety,quality,compliance,progress,final,pre_delivery',
-            'scheduled_date' => 'sometimes|date',
-            'priority' => 'sometimes|in:low,medium,high,critical',
-            'notes' => 'nullable|string',
-        ]);
+            // Step 3.2: Create inspection
+            $inspection = new Inspection();
+            $inspection->project_id = $request->project_id;
+            $inspection->title = $request->title;
+            $inspection->description = $request->description;
+            $inspection->inspection_date = $request->inspection_date;
+            $inspection->inspector_id = $request->inspector_id;
+            $inspection->category = $request->category;
+            $inspection->priority = $request->priority;
+            $inspection->status = $request->status ?? 'scheduled';
+            $inspection->notes = $request->notes;
+            $inspection->checklist = $request->checklist ?? [];
+            $inspection->code = $this->generateInspectionCode();
+            $inspection->is_deleted = false;
 
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
+            $inspection->save();
 
-        DB::beginTransaction();
-        try {
-            $inspection->update($request->all());
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Inspection updated successfully',
-                'data' => $inspection->load(['project', 'task', 'inspector'])
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update inspection',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    public function destroy(Request $request, Inspection $inspection)
-    {
-        DB::beginTransaction();
-        try {
-            // Delete associated photos
-            foreach ($inspection->photos as $photo) {
-                if ($photo->file_path) {
-                    Storage::disk('public')->delete($photo->file_path);
+            // Handle photo uploads if provided
+            if ($request->hasFile('photos')) {
+                foreach ($request->file('photos') as $photo) {
+                    $photoPath = $photo->store('inspection_photos', 'public');
+                    
+                    // Create photo record (assuming Photo model exists)
+                    $inspection->photos()->create([
+                        'file_path' => $photoPath,
+                        'file_type' => $photo->getClientOriginalExtension(),
+                        'file_size' => $photo->getSize(),
+                        'uploaded_by' => $request->user_id,
+                    ]);
                 }
-                $photo->delete();
             }
 
-            $inspection->delete();
-            DB::commit();
+            return $this->toJsonEnc($inspection->load(['project', 'inspector', 'photos']), 'Inspection created successfully', '201');
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Inspection deleted successfully'
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to delete inspection',
-                'error' => $e->getMessage()
-            ], 500);
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
     }
 
-    public function complete(Request $request, Inspection $inspection)
+    public function show(Request $request, $id)
     {
-        $validator = Validator::make($request->all(), [
-            'findings' => 'required|string',
-            'recommendations' => 'nullable|string',
-            'score' => 'nullable|numeric|min:0|max:100',
-            'notes' => 'nullable|string',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
         try {
-            $inspection->markAsCompleted([
-                'findings' => $request->findings,
-                'recommendations' => $request->recommendations,
-                'score' => $request->score,
-                'notes' => $request->notes,
-            ]);
+            $inspection = Inspection::with(['project', 'inspector', 'photos', 'snagReports'])
+                ->where('id', $id)
+                ->where('is_deleted', 0)
+                ->first();
 
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Inspection completed successfully',
-                'data' => $inspection->load(['project', 'task', 'inspector'])
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to complete inspection',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    public function updateStatus(Request $request, Inspection $inspection)
-    {
-        $validator = Validator::make($request->all(), [
-            'status' => 'required|in:scheduled,in_progress,completed,failed,cancelled',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $inspection->update(['status' => $request->status]);
-
-        if ($request->status === 'completed') {
-            $inspection->markAsCompleted();
-        }
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Inspection status updated successfully',
-            'data' => $inspection
-        ]);
-    }
-
-    public function uploadPhotos(Request $request, Inspection $inspection)
-    {
-        $validator = Validator::make($request->all(), [
-            'photos' => 'required|array',
-            'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
-            'descriptions' => 'nullable|array',
-            'descriptions.*' => 'nullable|string|max:255',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        DB::beginTransaction();
-        try {
-            $uploadedPhotos = [];
-
-            foreach ($request->file('photos') as $index => $photo) {
-                $path = $photo->store('inspection_photos', 'public');
-                
-                $inspectionPhoto = InspectionPhoto::create([
-                    'inspection_id' => $inspection->id,
-                    'file_path' => $path,
-                    'file_name' => $photo->getClientOriginalName(),
-                    'file_size' => $photo->getSize(),
-                    'mime_type' => $photo->getMimeType(),
-                    'description' => $request->descriptions[$index] ?? null,
-                    'uploaded_by' => $request->user()->id,
-                ]);
-
-                $uploadedPhotos[] = $inspectionPhoto;
+            if (!$inspection) {
+                return $this->toJsonEnc([], 'Inspection not found', '404');
             }
 
-            DB::commit();
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $inspection->project->company_id)
+                ->where('status', 'active')
+                ->exists();
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Photos uploaded successfully',
-                'data' => $uploadedPhotos
-            ], 201);
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
 
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to upload photos',
-                'error' => $e->getMessage()
-            ], 500);
+            return $this->toJsonEnc($inspection, 'Inspection retrieved successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
     }
 
-    public function getPhotos(Request $request, Inspection $inspection)
+    public function update(Request $request, $id)
     {
-        $photos = $inspection->photos()->with('uploadedBy')->get();
+        try {
+            $validator = Validator::make($request->all(), [
+                'title' => 'sometimes|required|string|max:255',
+                'description' => 'nullable|string|max:1000',
+                'inspection_date' => 'sometimes|required|date',
+                'inspector_id' => 'sometimes|required|exists:users,id',
+                'category' => 'sometimes|required|string|max:100',
+                'priority' => 'sometimes|required|in:low,medium,high,urgent',
+                'status' => 'sometimes|required|in:scheduled,in_progress,completed,failed',
+                'notes' => 'nullable|string|max:2000',
+                'checklist' => 'nullable|array',
+                'photos' => 'nullable|array',
+                'photos.*' => 'image|mimes:jpeg,png,jpg|max:2048',
+            ]);
 
-        return response()->json([
-            'success' => true,
-            'data' => $photos
-        ]);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $inspection = Inspection::find($id);
+
+            if (!$inspection) {
+                return $this->toJsonEnc([], 'Inspection not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $inspection->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $updateData = $request->only([
+                'title', 'description', 'inspection_date', 'inspector_id',
+                'category', 'priority', 'status', 'notes', 'checklist'
+            ]);
+
+            if ($request->has('checklist')) {
+                $updateData['checklist'] = $request->checklist;
+            }
+
+            $inspection->update($updateData);
+
+            // Handle new photo uploads
+            if ($request->hasFile('photos')) {
+                foreach ($request->file('photos') as $photo) {
+                    $photoPath = $photo->store('inspection_photos', 'public');
+                    
+                    $inspection->photos()->create([
+                        'file_path' => $photoPath,
+                        'file_type' => $photo->getClientOriginalExtension(),
+                        'file_size' => $photo->getSize(),
+                        'uploaded_by' => $request->user_id,
+                    ]);
+                }
+            }
+
+            return $this->toJsonEnc($inspection->load(['project', 'inspector', 'photos']), 'Inspection updated successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
     }
 
-    public function summary(Request $request)
+    public function destroy(Request $request, $id)
     {
-        $user = $request->user();
-        $company = $user->currentCompany;
+        try {
+            $inspection = Inspection::find($id);
 
-        if (!$company) {
-            return response()->json([
-                'success' => false,
-                'message' => 'No company selected'
-            ], 400);
+            if (!$inspection) {
+                return $this->toJsonEnc([], 'Inspection not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $inspection->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            // Soft delete
+            $inspection->update(['is_deleted' => true]);
+
+            return $this->toJsonEnc([], 'Inspection deleted successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    public function updateStatus(Request $request, $id)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'status' => 'required|in:scheduled,in_progress,completed,failed',
+                'notes' => 'nullable|string|max:2000',
+            ], [
+                'status.required' => 'Status is required',
+                'status.in' => 'Invalid status value',
+                'notes.max' => 'Notes cannot exceed 2000 characters',
+            ]);
+
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $inspection = Inspection::find($id);
+
+            if (!$inspection) {
+                return $this->toJsonEnc([], 'Inspection not found', '404');
+            }
+
+            // Check if user has access to this company
+            $hasAccess = UserCompany::where('user_id', $request->user_id)
+                ->where('company_id', $inspection->project->company_id)
+                ->where('status', 'active')
+                ->exists();
+
+            if (!$hasAccess) {
+                return $this->toJsonEnc([], 'Access denied', '403');
+            }
+
+            $updateData = ['status' => $request->status];
+            if ($request->has('notes')) {
+                $updateData['notes'] = $request->notes;
+            }
+
+            $inspection->update($updateData);
+
+            return $this->toJsonEnc($inspection->load(['project', 'inspector']), 'Inspection status updated successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
+    }
+
+    private function generateInspectionCode()
+    {
+        $code = 'INS' . strtoupper(Str::random(6));
+        
+        while (Inspection::where('code', $code)->exists()) {
+            $code = 'INS' . strtoupper(Str::random(6));
         }
 
-        $summary = [
-            'total_inspections' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->count(),
-            'scheduled_inspections' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'scheduled')->count(),
-            'completed_inspections' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'completed')->count(),
-            'failed_inspections' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('status', 'failed')->count(),
-            'overdue_inspections' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->where('scheduled_date', '<', now())
-              ->whereNotIn('status', ['completed', 'cancelled'])
-              ->count(),
-            'inspections_by_category' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->select('category', DB::raw('count(*) as count'))
-              ->groupBy('category')
-              ->pluck('count', 'category'),
-            'average_score' => Inspection::whereHas('project', function ($query) use ($company) {
-                $query->where('company_id', $company->id);
-            })->whereNotNull('score')->avg('score'),
-        ];
-
-        return response()->json([
-            'success' => true,
-            'data' => $summary
-        ]);
+        return $code;
     }
 }

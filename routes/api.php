@@ -14,29 +14,32 @@ use App\Http\Controllers\Api\NotificationController;
 
 /*
 |--------------------------------------------------------------------------
-| API Routes
+| API Routes - Refactored to match CODE_PATTERN_GUIDE.md
 |--------------------------------------------------------------------------
 */
 
-Route::prefix('v1')->group(function () {
-    // Authentication routes
+Route::prefix('v1')->middleware(['decrypt', 'verifyApiKey'])->group(function () {
+    
+    // Authentication routes (no token required)
     Route::prefix('auth')->group(function () {
         Route::post('register/step1', [AuthController::class, 'registerStep1']);
         Route::post('register/step2', [AuthController::class, 'registerStep2']);
         Route::post('register/step3', [AuthController::class, 'registerStep3']);
         Route::post('login', [AuthController::class, 'login']);
-        Route::post('logout', [AuthController::class, 'logout'])->middleware('auth:sanctum');
-        Route::post('refresh', [AuthController::class, 'refresh'])->middleware('auth:sanctum');
         Route::post('forgot-password', [AuthController::class, 'forgotPassword']);
         Route::post('reset-password', [AuthController::class, 'resetPassword']);
     });
 
-    // Protected routes
-    Route::middleware('auth:sanctum')->group(function () {
-        // User profile
-        Route::get('profile', [AuthController::class, 'profile']);
-        Route::put('profile', [AuthController::class, 'updateProfile']);
-        Route::post('change-password', [AuthController::class, 'changePassword']);
+    // Protected routes (require token)
+    Route::middleware(['checkUserToken'])->group(function () {
+        
+        // User profile management
+        Route::prefix('profile')->group(function () {
+            Route::get('/', [AuthController::class, 'profile']);
+            Route::put('/', [AuthController::class, 'updateProfile']);
+            Route::post('change-password', [AuthController::class, 'changePassword']);
+            Route::post('logout', [AuthController::class, 'logout']);
+        });
 
         // Company management
         Route::prefix('companies')->group(function () {

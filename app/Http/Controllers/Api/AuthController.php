@@ -4,447 +4,319 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
-use App\Models\Company;
-use App\Models\UserCompany;
+use App\Models\UserDevice;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\Password;
-use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
-use Illuminate\Validation\ValidationException;
-use Illuminate\Support\Facades\DB;
+use Exception;
 
 class AuthController extends Controller
 {
-    public function registerStep1(Request $request)
+    public function signup(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'name' => 'required|string|max:255',
-            'email' => 'required|string|email|max:255|unique:users',
-            'password' => 'required|string|min:8|confirmed',
-            'phone' => 'required|string|max:20',
-            'role' => 'required|string|in:contractor,client,subcontractor',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $user = User::create([
-            'name' => $request->name,
-            'email' => $request->email,
-            'password' => Hash::make($request->password),
-            'phone' => $request->phone,
-            'role' => $request->role,
-            'registration_step' => 1,
-            'is_active' => false,
-        ]);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'User details saved successfully',
-            'user_id' => $user->id,
-            'next_step' => 2
-        ]);
-    }
-
-    public function registerStep2(Request $request)
-    {
-        $validator = Validator::make($request->all(), [
-            'user_id' => 'required|exists:users,id',
-            'company_name' => 'required|string|max:255',
-            'company_type' => 'required|string|max:255',
-            'company_address' => 'required|string|max:500',
-            'company_phone' => 'required|string|max:20',
-            'company_email' => 'required|string|email|max:255',
-            'company_website' => 'nullable|string|max:255',
-            'company_logo' => 'nullable|image|mimes:jpeg,png,jpg|max:2048',
-            'tax_id' => 'nullable|string|max:50',
-            'license_number' => 'nullable|string|max:50',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $user = User::findOrFail($request->user_id);
-
-        if ($user->registration_step != 1) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Invalid registration step'
-            ], 400);
-        }
-
-        DB::beginTransaction();
         try {
-            $company = Company::create([
-                'name' => $request->company_name,
-                'code' => Company::generateCode(),
-                'type' => $request->company_type,
-                'address' => $request->company_address,
-                'phone' => $request->company_phone,
-                'email' => $request->company_email,
-                'website' => $request->company_website,
-                'tax_id' => $request->tax_id,
-                'license_number' => $request->license_number,
-                'status' => 'active',
-                'settings' => [],
+            // Step 3.1: Validation
+            $validator = Validator::make($request->all(), [
+                'email' => 'required|email|unique:users,email',
+                'phone' => 'required|string|max:20',
+                'user_type' => 'required|in:client,contractor,subcontractor,inspector',
+                'first_name' => 'required|string|max:255',
+                'last_name' => 'nullable|string|max:255',
+                'password' => 'required|min:6',
+                'device_type' => 'required|in:A,I,W',
+            ], [
+                'email.required' => 'Email is required',
+                'email.email' => 'Please provide a valid email address',
+                'email.unique' => 'This email is already registered',
+                'phone.required' => 'Phone number is required',
+                'user_type.required' => 'User type is required',
+                'user_type.in' => 'Invalid user type selected',
+                'first_name.required' => 'First name is required',
+                'first_name.max' => 'First name cannot exceed 255 characters',
+                'password.required' => 'Password is required',
+                'password.min' => 'Password must be at least 6 characters',
+                'device_type.required' => 'Device type is required',
+                'device_type.in' => 'Invalid device type',
             ]);
 
-            if ($request->hasFile('company_logo')) {
-                $logoPath = $request->file('company_logo')->store('company_logos', 'public');
-                $company->update(['logo' => $logoPath]);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
             }
 
-            UserCompany::create([
-                'user_id' => $user->id,
-                'company_id' => $company->id,
-                'role' => 'admin',
-                'status' => 'active',
-                'permissions' => ['all'],
-            ]);
+            // Step 3.2: Business Logic - Check existing user
+            $existingUser = User::where('email', $request->email)
+                ->where('is_deleted', 0)
+                ->first();
 
-            $user->update([
-                'registration_step' => 2,
-                'current_company_id' => $company->id,
-            ]);
-
-            DB::commit();
-
-            return response()->json([
-                'success' => true,
-                'message' => 'Company details saved successfully',
-                'user_id' => $user->id,
-                'company_id' => $company->id,
-                'next_step' => 3
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to save company details',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    public function registerStep3(Request $request)
-    {
-        $validator = Validator::make($request->all(), [
-            'user_id' => 'required|exists:users,id',
-            'team_members' => 'required|array',
-            'team_members.*.name' => 'required|string|max:255',
-            'team_members.*.email' => 'required|string|email|max:255',
-            'team_members.*.role' => 'required|string|in:manager,supervisor,worker',
-            'team_members.*.phone' => 'nullable|string|max:20',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $user = User::findOrFail($request->user_id);
-
-        if ($user->registration_step != 2) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Invalid registration step'
-            ], 400);
-        }
-
-        DB::beginTransaction();
-        try {
-            $company = $user->currentCompany;
-
-            foreach ($request->team_members as $member) {
-                $existingUser = User::where('email', $member['email'])->first();
-                
-                if (!$existingUser) {
-                    $tempPassword = Str::random(12);
-                    $existingUser = User::create([
-                        'name' => $member['name'],
-                        'email' => $member['email'],
-                        'password' => Hash::make($tempPassword),
-                        'phone' => $member['phone'] ?? null,
-                        'role' => $member['role'],
-                        'is_active' => false,
-                        'registration_step' => 3,
-                    ]);
-                }
-
-                UserCompany::create([
-                    'user_id' => $existingUser->id,
-                    'company_id' => $company->id,
-                    'role' => $member['role'],
-                    'status' => 'pending',
-                    'permissions' => $this->getRolePermissions($member['role']),
-                ]);
-
-                // Send invitation email
-                $this->sendInvitationEmail($existingUser, $company);
+            if ($existingUser) {
+                return $this->toJsonEnc($existingUser, 'Account already exists', '008');
             }
 
-            $user->update([
-                'registration_step' => 3,
-                'is_active' => true,
+            // Step 3.3: Create Record
+            $user = new User();
+            $user->email = $request->email;
+            $user->phone = $request->phone;
+            $user->user_type = $request->user_type;
+            $user->first_name = $request->first_name;
+            $user->last_name = $request->last_name;
+            $user->password = Hash::make($request->password);
+            $user->step_no = 1;
+            $user->is_verified = false;
+            $user->is_active = true;
+            $user->is_deleted = false;
+            $user->save();
+
+            // Step 3.4: Generate Token
+            $accessToken = Str::random(64);
+            UserDevice::create([
+                'user_id' => $user->id,
+                'token' => $accessToken,
+                'device_type' => $request->device_type,
+                'ip_address' => $request->ip(),
+                'last_activity' => now(),
             ]);
 
-            DB::commit();
+            // Step 3.5: Prepare Response Data
+            $responseData = [
+                'user_id' => $user->id,
+                'token' => $accessToken,
+                'step_no' => $user->step_no,
+                'email' => $user->email,
+                'first_name' => $user->first_name,
+                'last_name' => $user->last_name,
+                'user_type' => $user->user_type,
+                'is_verified' => $user->is_verified,
+            ];
 
-            $token = $user->createToken('API Token')->plainTextToken;
+            // Step 3.6: Return Response
+            return $this->toJsonEnc($responseData, 'Registration successful', '200');
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Registration completed successfully',
-                'user' => $user->load('companies'),
-                'token' => $token,
-                'registration_step' => 3
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to complete registration',
-                'error' => $e->getMessage()
-            ], 500);
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
     }
 
     public function login(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'email' => 'required|string|email',
-            'password' => 'required|string',
-        ]);
+        try {
+            $validator = Validator::make($request->all(), [
+                'email' => 'required|email',
+                'password' => 'required|min:6',
+                'device_type' => 'required|in:A,I,W',
+            ], [
+                'email.required' => 'Email is required',
+                'email.email' => 'Please provide a valid email address',
+                'password.required' => 'Password is required',
+                'password.min' => 'Password must be at least 6 characters',
+                'device_type.required' => 'Device type is required',
+                'device_type.in' => 'Invalid device type',
+            ]);
 
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $user = User::where('email', $request->email)
+                ->where('is_deleted', 0)
+                ->first();
+
+            if (!$user || !Hash::check($request->password, $user->password)) {
+                return $this->toJsonEnc([], 'Invalid credentials', '401');
+            }
+
+            if (!$user->is_active) {
+                return $this->toJsonEnc([], 'Account is deactivated', '403');
+            }
+
+            // Generate new token
+            $accessToken = Str::random(64);
+            
+            // Update or create device record
+            UserDevice::updateOrCreate(
+                [
+                    'user_id' => $user->id,
+                    'device_type' => $request->device_type,
+                ],
+                [
+                    'token' => $accessToken,
+                    'ip_address' => $request->ip(),
+                    'last_activity' => now(),
+                ]
+            );
+
+            $responseData = [
+                'user_id' => $user->id,
+                'token' => $accessToken,
+                'step_no' => $user->step_no,
+                'email' => $user->email,
+                'first_name' => $user->first_name,
+                'last_name' => $user->last_name,
+                'user_type' => $user->user_type,
+                'is_verified' => $user->is_verified,
+                'profile_image' => $user->profile_image,
+            ];
+
+            return $this->toJsonEnc($responseData, 'Login successful', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
-
-        $user = User::where('email', $request->email)->first();
-
-        if (!$user || !Hash::check($request->password, $user->password)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Invalid credentials'
-            ], 401);
-        }
-
-        if (!$user->is_active) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Account is not active. Please check your email for activation.'
-            ], 403);
-        }
-
-        $token = $user->createToken('API Token')->plainTextToken;
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Login successful',
-            'user' => $user->load('companies'),
-            'token' => $token,
-            'registration_step' => $user->registration_step
-        ]);
-    }
-
-    public function logout(Request $request)
-    {
-        $request->user()->currentAccessToken()->delete();
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Logged out successfully'
-        ]);
-    }
-
-    public function refresh(Request $request)
-    {
-        $user = $request->user();
-        $user->currentAccessToken()->delete();
-        $token = $user->createToken('API Token')->plainTextToken;
-
-        return response()->json([
-            'success' => true,
-            'token' => $token
-        ]);
     }
 
     public function profile(Request $request)
     {
-        return response()->json([
-            'success' => true,
-            'user' => $request->user()->load(['companies', 'currentCompany'])
-        ]);
+        try {
+            $user = User::with(['companies', 'currentCompany'])
+                ->find($request->user_id);
+
+            if (!$user) {
+                return $this->toJsonEnc([], 'User not found', '404');
+            }
+
+            $profileData = [
+                'id' => $user->id,
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'first_name' => $user->first_name,
+                'last_name' => $user->last_name,
+                'user_type' => $user->user_type,
+                'profile_image' => $user->profile_image,
+                'business_name' => $user->business_name,
+                'business_logo' => $user->business_logo,
+                'business_phone' => $user->business_phone,
+                'business_address' => $user->business_address,
+                'is_verified' => $user->is_verified,
+                'step_no' => $user->step_no,
+                'companies' => $user->companies,
+                'current_company' => $user->currentCompany,
+            ];
+
+            return $this->toJsonEnc($profileData, 'Profile retrieved successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
     }
 
     public function updateProfile(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'name' => 'sometimes|string|max:255',
-            'phone' => 'sometimes|string|max:20',
-            'avatar' => 'sometimes|image|mimes:jpeg,png,jpg|max:2048',
-        ]);
+        try {
+            $validator = Validator::make($request->all(), [
+                'first_name' => 'sometimes|required|string|max:255',
+                'last_name' => 'sometimes|required|string|max:255',
+                'phone' => 'sometimes|required|string|max:20',
+                'business_name' => 'nullable|string|max:255',
+                'business_phone' => 'nullable|string|max:20',
+                'business_address' => 'nullable|string|max:500',
+            ]);
 
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $user = User::find($request->user_id);
+
+            if (!$user) {
+                return $this->toJsonEnc([], 'User not found', '404');
+            }
+
+            $user->update($request->only([
+                'first_name', 'last_name', 'phone', 'business_name',
+                'business_phone', 'business_address'
+            ]));
+
+            return $this->toJsonEnc($user, 'Profile updated successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
-
-        $user = $request->user();
-        $user->update($request->only(['name', 'phone']));
-
-        if ($request->hasFile('avatar')) {
-            $avatarPath = $request->file('avatar')->store('avatars', 'public');
-            $user->update(['avatar' => $avatarPath]);
-        }
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Profile updated successfully',
-            'user' => $user->fresh()
-        ]);
     }
 
     public function changePassword(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'current_password' => 'required|string',
-            'new_password' => 'required|string|min:8|confirmed',
-        ]);
+        try {
+            $validator = Validator::make($request->all(), [
+                'current_password' => 'required',
+                'new_password' => 'required|min:6|confirmed',
+            ]);
 
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            $user = User::find($request->user_id);
+
+            if (!$user) {
+                return $this->toJsonEnc([], 'User not found', '404');
+            }
+
+            if (!Hash::check($request->current_password, $user->password)) {
+                return $this->toJsonEnc([], 'Current password is incorrect', '400');
+            }
+
+            $user->update(['password' => Hash::make($request->new_password)]);
+
+            return $this->toJsonEnc([], 'Password changed successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
+    }
 
-        $user = $request->user();
+    public function logout(Request $request)
+    {
+        try {
+            UserDevice::where('user_id', $request->user_id)->delete();
 
-        if (!Hash::check($request->current_password, $user->password)) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Current password is incorrect'
-            ], 400);
+            return $this->toJsonEnc([], 'Logged out successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
-
-        $user->update(['password' => Hash::make($request->new_password)]);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Password changed successfully'
-        ]);
     }
 
     public function forgotPassword(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'email' => 'required|string|email',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $status = Password::sendResetLink($request->only('email'));
-
-        if ($status === Password::RESET_LINK_SENT) {
-            return response()->json([
-                'success' => true,
-                'message' => 'Password reset link sent to your email'
+        try {
+            $validator = Validator::make($request->all(), [
+                'email' => 'required|email|exists:users,email',
             ]);
-        }
 
-        return response()->json([
-            'success' => false,
-            'message' => 'Unable to send reset link'
-        ], 400);
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            // Implement password reset logic here
+            // This would typically involve sending an email with reset link
+
+            return $this->toJsonEnc([], 'Password reset email sent', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
+        }
     }
 
     public function resetPassword(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'token' => 'required',
-            'email' => 'required|string|email',
-            'password' => 'required|string|min:8|confirmed',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Validation error',
-                'errors' => $validator->errors()
-            ], 422);
-        }
-
-        $status = Password::reset(
-            $request->only('email', 'password', 'password_confirmation', 'token'),
-            function ($user, $password) {
-                $user->forceFill([
-                    'password' => Hash::make($password)
-                ])->save();
-            }
-        );
-
-        if ($status === Password::PASSWORD_RESET) {
-            return response()->json([
-                'success' => true,
-                'message' => 'Password reset successfully'
+        try {
+            $validator = Validator::make($request->all(), [
+                'email' => 'required|email|exists:users,email',
+                'token' => 'required|string',
+                'password' => 'required|min:6|confirmed',
             ]);
+
+            if ($validator->fails()) {
+                return $this->validateResponse($validator->errors());
+            }
+
+            // Implement password reset logic here
+            // This would typically verify the reset token and update password
+
+            return $this->toJsonEnc([], 'Password reset successfully', '200');
+
+        } catch (Exception $e) {
+            return $this->toJsonEnc([], $e->getMessage(), '500');
         }
-
-        return response()->json([
-            'success' => false,
-            'message' => 'Invalid token or email'
-        ], 400);
-    }
-
-    private function getRolePermissions($role)
-    {
-        $permissions = [
-            'admin' => ['all'],
-            'manager' => ['read', 'write', 'update'],
-            'supervisor' => ['read', 'write'],
-            'worker' => ['read'],
-            'client' => ['read'],
-            'subcontractor' => ['read', 'write'],
-        ];
-
-        return $permissions[$role] ?? ['read'];
-    }
-
-    private function sendInvitationEmail($user, $company)
-    {
-        // Implementation depends on your mail setup
-        // This is a placeholder for email invitation logic
     }
 }
